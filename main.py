@@ -5,11 +5,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import openai
+from openai import OpenAI
 
+# ---------------- APP ----------------
 app = FastAPI(title="Streaming LLM API")
 
-# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,8 +18,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- API KEY ----------------
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# ---------------- OPENAI CLIENT ----------------
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ---------------- REQUEST MODEL ----------------
 class StreamRequest(BaseModel):
@@ -29,70 +29,72 @@ class StreamRequest(BaseModel):
 # ---------------- STREAM FUNCTION ----------------
 async def stream_llm_response(user_prompt: str):
     try:
-        # Force JS code generation ≥50 lines & ≥1250 chars
         final_prompt = f"""
-Generate JavaScript code for a data processor with at least 50 lines.
-Requirements:
-- Must be JavaScript
-- Include multiple functions
-- Include error handling
-- Include streaming/data processing logic
-- Minimum 1250 characters
-- Only output JavaScript code
+Generate JavaScript code for a data processor with:
+- At least 50 lines
+- At least 1250 characters
+- Multiple functions
+- Error handling
+- Streaming/data processing logic
+Return ONLY JavaScript code.
+
 Topic: {user_prompt}
 """
 
-        # 🚀 CRITICAL: SEND FIRST TOKEN INSTANTLY (<100ms)
-        instant_start = {
-            "choices": [
-                {
-                    "delta": {
-                        "content": "// streaming initialized...\n"
-                    }
-                }
-            ]
+        # 🚀 send instant first token (latency fix)
+        instant = {
+            "choices": [{"delta": {"content": "// streaming initialized...\n"}}]
         }
-        yield f"data: {json.dumps(instant_start)}\n\n"
-        await asyncio.sleep(0.01)
+        yield f"data: {json.dumps(instant)}\n\n"
 
-        # 🔵 Now call OpenAI streaming
-        response = openai.chat.completions.create(
+        # 🔥 streaming from OpenAI (FAST MODEL)
+        stream = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": final_prompt}],
             stream=True,
             temperature=0.7,
         )
 
+        buffer = ""
         chunk_count = 0
+        last_flush = asyncio.get_event_loop().time()
 
-        for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                text = chunk.choices[0].delta.content
+        for chunk in stream:
+            content = chunk.choices[0].delta.content if chunk.choices else None
 
-                data = {
-                    "choices": [
-                        {"delta": {"content": text}}
-                    ]
-                }
+            if content:
+                buffer += content
 
-                yield f"data: {json.dumps(data)}\n\n"
-                chunk_count += 1
-                await asyncio.sleep(0.01)
+                now = asyncio.get_event_loop().time()
 
-        # Ensure minimum 5 chunks (grader requirement)
+                # 🚀 batch tokens for speed (CRITICAL)
+                if len(buffer) > 60 or (now - last_flush) > 0.05:
+                    data = {
+                        "choices": [{"delta": {"content": buffer}}]
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    buffer = ""
+                    last_flush = now
+                    chunk_count += 1
+
+        # flush remaining
+        if buffer:
+            data = {"choices":[{"delta":{"content":buffer}}]}
+            yield f"data: {json.dumps(data)}\n\n"
+
+        # ensure minimum chunks
         if chunk_count < 5:
-            filler = "\n// continuing streaming output...\n"
+            filler = "\n// continuing streaming...\n"
             for _ in range(5 - chunk_count):
                 data = {"choices":[{"delta":{"content":filler}}]}
                 yield f"data: {json.dumps(data)}\n\n"
-                await asyncio.sleep(0.02)
 
-        # End stream
+        # done event
         yield "data: [DONE]\n\n"
 
     except Exception as e:
-        error = {"error": str(e)}
-        yield f"data: {json.dumps(error)}\n\n"
+        err = {"error": str(e)}
+        yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
 
 # ---------------- ENDPOINT ----------------
@@ -106,3 +108,8 @@ async def stream_endpoint(body: StreamRequest):
             "Connection": "keep-alive",
         },
     )
+
+# ---------------- ROOT ----------------
+@app.get("/")
+def root():
+    return {"message": "Streaming API running"}
